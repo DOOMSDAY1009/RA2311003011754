@@ -1,0 +1,15 @@
+{
+  "name": "notification_app_be",
+  "version": "1.0.0",
+  "description": "Stage 6 — Priority Inbox: top-N priority notifications using a bounded min-heap, weight (placement>result>event) + recency.",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "example": "node examples/synthetic.js"
+  },
+  "dependencies": {
+    "logging-middleware": "file:../logging_middleware"
+  },
+  "engines": { "node": ">=18" },
+  "license": "MIT"
+}
