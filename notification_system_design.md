@@ -611,3 +611,65 @@ Key shifts vs the original loop:
 | Re-runs duplicate | Idempotency keys per `(notif, channel)` |
 | One slow API blocks all | Per-channel queues isolate failures |
 | No visibility | `broadcasts.status` + per-channel delivery state |
+
+---
+
+## Stage 6 — Priority Inbox
+
+> Code lives in [`notification_app_be/`](./notification_app_be/). Run with `npm start` (after populating `secrets.local.json`) or `npm run example` for the synthetic-data smoke test. Output screenshots are in `notification_app_be/screenshots/`.
+
+### Priority formula
+
+```
+score(n) = TYPE_WEIGHT[n.Type] * 1e15 + epochMs(n.Timestamp)
+
+TYPE_WEIGHT = { Placement: 3, Result: 2, Event: 1 }
+```
+
+The multiplier `1e15` is larger than any plausible epoch-ms timestamp, so type weight strictly dominates and timestamp acts as a pure tiebreaker. Every Placement outranks every Result regardless of age; within the same type, newer wins. This matches the natural reading of "weight (placement > result > event) and recency."
+
+An alternative softer formula — `weight * exp(-age/halfLife)` — lets a *very* fresh Event outrank a year-old Placement. That's a reasonable product call too, but the strict-tuple version aligns more directly with the way the prompt phrases the rule.
+
+### Algorithm: bounded min-heap
+
+A naive `notifications.sort().slice(0, n)` is `O(N log N)` time and `O(N)` memory. That's fine for one shot, but the prompt explicitly asks how to maintain top-N efficiently as new notifications stream in. For that, sort+slice has to redo `O(N log N)` work on every arrival.
+
+A **bounded min-heap of size n** does it in `O(N log n)` time and `O(n)` memory for the initial pass, plus `O(log n)` per new arrival:
+
+- The heap holds at most `n` items. The smallest score sits at the root.
+- New arrival comes in. Compare to the root.
+- If heap has fewer than `n` items → push it.
+- Else if `newScore > rootScore` → replace root, sift down.
+- Else → discard. The expensive case is just one comparison.
+
+For `n = 10` that's ~3.3 ops per item regardless of how big the firehose is. The `ingest()` method also returns a boolean — `true` if the item entered the top-N, `false` if it was discarded — which is the cheapest possible "did anything change, do I need to re-render the UI?" signal.
+
+### Code
+
+`notification_app_be/src/priority-inbox.js` exposes:
+
+- `priorityScore(notification)` — pure function, returns the composite score.
+- `BoundedMinHeap` — generic capacity-bounded min-heap (`consider`, `peek`, `toSortedDesc`).
+- `topNNotifications(notifications, n)` — single-pass top-N over a static list.
+- `PriorityInbox` — class wrapper for the live-stream case (`ingest`, `ingestMany`, `top`).
+
+`src/index.js` fetches `/evaluation-service/notifications` via the shared authed client (which reuses the logging-middleware's auth + token-refresh), runs `topNNotifications`, and prints a ranked table. `examples/synthetic.js` runs the same logic against fixed in-memory data so the ordering can be verified without touching the network.
+
+### Maintaining top-N as new notifications arrive
+
+In a long-running service, wrap the heap in `PriorityInbox`:
+
+```js
+const inbox = new PriorityInbox(10);
+inbox.ingestMany(await fetchNotifications());          // initial seed
+
+ws.on('message', (raw) => {
+  const event = JSON.parse(raw);
+  if (event.type === 'notification.created') {
+    const changed = inbox.ingest(event.data);
+    if (changed) reRenderUI(inbox.top());              // only re-render when the heap actually shifts
+  }
+});
+```
+
+Each arrival is `O(log 10)` ≈ constant; the UI only re-renders when the top-N actually changes. Memory is bounded at exactly `n` items regardless of how many notifications the user has accumulated.
